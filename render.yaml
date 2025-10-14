@@ -4,7 +4,7 @@ services:
     env: python
     repo: https://github.com/S88913/footystats-bot
     buildCommand: pip install -r requirements.txt
-    startCommand: python3 bot.py
+    startCommand: cd /opt/render/project/src && python3 bot.py
     envVars:
       - key: TELEGRAM_TOKEN
         value: 7912248885:AAFwOdg0rX3weVr6NXzW1adcUorvlRY8LyI
