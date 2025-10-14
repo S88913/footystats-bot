@@ -2,8 +2,9 @@ services:
   - type: worker
     name: footystats-bot
     env: python
+    repo: https://github.com/S88913/footystats-bot
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    startCommand: python3 bot.py
     envVars:
       - key: TELEGRAM_TOKEN
         value: 7912248885:AAFwOdg0rX3weVr6NXzW1adcUorvlRY8LyI
