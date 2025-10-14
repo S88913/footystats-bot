@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '7912248885:AAFwOdg0rX3weVr6NXzW1adcUorvlRY8LyI')
 CHAT_ID = os.getenv('CHAT_ID', '6146221712')
 RAPIDAPI_KEY = os.getenv('RAPIDAPI_KEY', '686f007a59c2156eb6c1efd2')
-GITHUB_CSV_URL = os.getenv('GITHUB_CSV_URL', 'https://raw.githubusercontent.com/YOUR_USERNAME/footystats-bot/main/matches_today.csv')
+GITHUB_CSV_URL = os.getenv('GITHUB_CSV_URL', 'https://raw.githubusercontent.com/S88913/footystats-bot/main/matches_today.csv')
 AVG_GOALS_THRESHOLD = 2.50
 CHECK_TIME_MINUTES = 50
 
