@@ -2,57 +2,43 @@ import os
 import time
 import requests
 import csv
-from datetime import datetime
+from datetime import datetime, timezone
 from io import StringIO
 import logging
 from urllib.parse import parse_qsl
 
-# ================= Logging =================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+# ===== Logging =====
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# ================= ENV =================
+# ===== ENV =====
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID        = os.getenv("CHAT_ID")
 RAPIDAPI_KEY   = os.getenv("RAPIDAPI_KEY")
 
-# Config dall'endpoint dello screenshot
+# Endpoint (dal tuo screenshot)
 RAPIDAPI_HOST        = os.getenv("RAPIDAPI_HOST", "bet365data.p.rapidapi.com")
 RAPIDAPI_BASE        = os.getenv("RAPIDAPI_BASE", f"https://{RAPIDAPI_HOST}")
 RAPIDAPI_EVENTS_PATH = os.getenv("RAPIDAPI_EVENTS_PATH", "/live-events")
-# accetta "k=v&k2=v2" e lo converte in dict
-RAPIDAPI_EVENTS_PARAMS = dict(parse_qsl(os.getenv("RAPIDAPI_EVENTS_PARAMS", "")))
+RAPIDAPI_EVENTS_PARAMS = dict(parse_qsl(os.getenv("RAPIDAPI_EVENTS_PARAMS", "")))  # es: "sport=soccer"
 
 # Bot config
-GITHUB_CSV_URL = os.getenv(
-    "GITHUB_CSV_URL",
-    "https://raw.githubusercontent.com/<USERNAME>/footystats-bot/main/matches_today.csv"
-)
+GITHUB_CSV_URL      = os.getenv("GITHUB_CSV_URL", "https://raw.githubusercontent.com/<USERNAME>/footystats-bot/main/matches_today.csv")
 AVG_GOALS_THRESHOLD = float(os.getenv("AVG_GOALS_THRESHOLD", "2.5"))
 CHECK_TIME_MINUTES  = int(os.getenv("CHECK_TIME_MINUTES", "50"))
 CHECK_INTERVAL      = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
+LEAGUE_EXCLUDE_KEYWORDS = [kw.strip().lower() for kw in os.getenv("LEAGUE_EXCLUDE_KEYWORDS", "Esoccer").split(",") if kw.strip()]
 
-LEAGUE_EXCLUDE_KEYWORDS = [
-    kw.strip().lower()
-    for kw in os.getenv("LEAGUE_EXCLUDE_KEYWORDS", "Esoccer").split(",")
-    if kw.strip()
-]
-
-# Stato runtime
 notified_matches = set()
 
-# ================= Utilities =================
+# ===== Utils =====
 def send_telegram_message(message: str) -> bool:
     if not TELEGRAM_TOKEN or not CHAT_ID:
         logger.error("TELEGRAM_TOKEN/CHAT_ID non impostati.")
         return False
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
-        r = requests.post(url, data=data, timeout=15)
+        r = requests.post(url, data={"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=15)
         if r.ok:
             logger.info("Telegram: messaggio inviato")
             return True
@@ -95,26 +81,15 @@ def http_get(url, headers=None, params=None, timeout=25):
         return None
 
 def get_live_matches():
-    """
-    Chiama /live-events?sport=soccer sull'host bet365data.p.rapidapi.com
-    Response attesa: {"data": {"events": [ {home, away, SS, TU, league, id, ...}, ... ] } }
-    """
+    """/live-events?sport=soccer (bet365data) → normalizza in id, home, away, SS, TU, league"""
     if not RAPIDAPI_KEY:
         logger.error("RAPIDAPI_KEY mancante.")
         return []
 
     url = f"{RAPIDAPI_BASE.rstrip('/')}/{RAPIDAPI_EVENTS_PATH.lstrip('/')}"
-    headers = {
-        "X-RapidAPI-Key": RAPIDAPI_KEY,
-        "X-RapidAPI-Host": RAPIDAPI_HOST
-    }
-
+    headers = {"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": RAPIDAPI_HOST}
     r = http_get(url, headers=headers, params=RAPIDAPI_EVENTS_PARAMS, timeout=25)
     if not r or not r.ok:
-        if r is not None and r.status_code == 403:
-            logger.error(
-                "403 Forbidden. Verifica: piano attivo, quota e path/parametri esatti (vedi Test Endpoint)."
-            )
         return []
 
     try:
@@ -127,24 +102,17 @@ def get_live_matches():
     raw_events = root.get("events") or []
 
     events = []
-    for item in raw_events:
-        league = (item.get("league") or item.get("CT") or "N/A").strip()
+    for it in raw_events:
+        league = (it.get("league") or it.get("CT") or "N/A").strip()
         if any(ex in league.lower() for ex in LEAGUE_EXCLUDE_KEYWORDS):
             continue
-
-        home = (item.get("home") or "").strip()
-        away = (item.get("away") or "").strip()
-        score = (item.get("SS") or "").strip()
-        match_id = str(item.get("id") or item.get("IID") or item.get("fi") or f"{home}-{away}")
-        tu = (item.get("TU") or "").strip()  # formato YYYYMMDDHHMMSS
-
         events.append({
-            "id": match_id,
-            "home": home,
-            "away": away,
+            "id": str(it.get("id") or it.get("IID") or it.get("fi") or ""),
+            "home": (it.get("home") or "").strip(),
+            "away": (it.get("away") or "").strip(),
             "league": league,
-            "SS": score,
-            "TU": tu
+            "SS": (it.get("SS") or "").strip(),
+            "TU": (it.get("TU") or "").strip(),  # "YYYYMMDDHHMMSS"
         })
 
     logger.info("API live-events: %d match live", len(events))
@@ -152,27 +120,25 @@ def get_live_matches():
 
 def parse_timestamp(tu_string):
     try:
-        return datetime.strptime(tu_string, "%Y%m%d%H%M%S")
+        return datetime.strptime(tu_string, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
     except Exception:
         return None
 
 def get_elapsed_minutes(start_time) -> int:
     try:
-        return int((datetime.utcnow() - start_time).total_seconds() // 60)
+        return int((datetime.now(timezone.utc) - start_time).total_seconds() // 60)
     except Exception:
         return 0
 
-def _norm(s: str) -> str:
-    return (s or "").lower().strip()
-
+def _norm(s): return (s or "").lower().strip()
 def _soft_team_match(a: str, b: str) -> bool:
-    # match "morbido" (gestisce U19, (W), FC, punti, ecc.)
     def clean(x: str) -> str:
         x = x.lower()
         for junk in [" (w)", "(w)", " (u19)", "(u19)", " u19", " u20", " fc", " cf", ".", ","]:
             x = x.replace(junk, "")
         return " ".join(x.split())
-    return clean(a) == clean(b) or clean(a) in clean(b) or clean(b) in clean(a)
+    A, B = clean(a), clean(b)
+    return A == B or A in B or B in A
 
 def match_teams(csv_match, live_match) -> bool:
     csv_home = _norm(csv_match.get("Home Team"))
@@ -184,24 +150,19 @@ def match_teams(csv_match, live_match) -> bool:
     return _soft_team_match(csv_home, live_home) and _soft_team_match(csv_away, live_away)
 
 def check_matches():
-    logger.info("=" * 60)
-    logger.info("INIZIO CONTROLLO")
-    logger.info("=" * 60)
+    logger.info("=" * 60); logger.info("INIZIO CONTROLLO"); logger.info("=" * 60)
 
     csv_matches = load_csv_from_github()
     if not csv_matches:
-        logger.warning("CSV vuoto")
-        return
+        logger.warning("CSV vuoto"); return
 
     filtered = filter_matches_by_avg(csv_matches)
     if not filtered:
-        logger.info("Nessun match con AVG >= soglia")
-        return
+        logger.info("Nessun match con AVG >= soglia"); return
 
     live = get_live_matches()
     if not live:
-        logger.info("Nessun live attualmente")
-        return
+        logger.info("Nessun live attualmente"); return
 
     opportunities = 0
     for cm in filtered:
@@ -217,12 +178,10 @@ def check_matches():
             tu_time = lm.get("TU") or ""
             start_time = parse_timestamp(tu_time)
             if not start_time:
-                logger.debug("TU mancante/non valido per %s", lm.get("id"))
-                continue
+                logger.debug("TU mancante/non valido per %s", lm.get("id")); continue
 
             elapsed = get_elapsed_minutes(start_time)
-            logger.info("Match %s vs %s | %s | %d' | %s",
-                        lm.get('home'), lm.get('away'), score, elapsed, lm.get('league'))
+            logger.info("Match %s vs %s | %s | %d' | %s", lm.get('home'), lm.get('away'), score, elapsed, lm.get('league'))
 
             if elapsed >= CHECK_TIME_MINUTES and score == "0-0":
                 opportunities += 1
@@ -252,8 +211,7 @@ def main():
             logger.info("Sleep %ds…", CHECK_INTERVAL)
             time.sleep(CHECK_INTERVAL)
         except KeyboardInterrupt:
-            send_telegram_message("⛔ Bot arrestato")
-            break
+            send_telegram_message("⛔ Bot arrestato"); break
         except Exception as e:
             logger.exception("Errore loop principale: %s", e)
             time.sleep(60)
