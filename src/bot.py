@@ -1,21 +1,23 @@
 import os
 import time
-import requests
 import csv
-from datetime import datetime, timezone
+import re
+import unicodedata
 from io import StringIO
+from datetime import datetime, timezone
 import logging
+import requests
 from urllib.parse import parse_qsl
 
 # ===== Logging =====
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+DEBUG_LOG = os.getenv("DEBUG_LOG", "0") == "1"
 
 # ===== ENV =====
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID        = os.getenv("CHAT_ID")
 RAPIDAPI_KEY   = os.getenv("RAPIDAPI_KEY")
-
 RAPIDAPI_HOST  = os.getenv("RAPIDAPI_HOST", "bet365data.p.rapidapi.com")
 RAPIDAPI_BASE  = os.getenv("RAPIDAPI_BASE", f"https://{RAPIDAPI_HOST}")
 RAPIDAPI_EVENTS_PATH   = os.getenv("RAPIDAPI_EVENTS_PATH", "/live-events")
@@ -29,10 +31,10 @@ LEAGUE_EXCLUDE_KEYWORDS = [kw.strip().lower() for kw in os.getenv("LEAGUE_EXCLUD
 
 notified_matches = set()
 
-# ===== Utils =====
+# ===== Helpers =====
 def send_telegram_message(message: str) -> bool:
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        logger.error("TELEGRAM_TOKEN/CHAT_ID non impostati.")
+        logger.error("TELEGRAM_TOKEN/CHAT_ID mancanti.")
         return False
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -68,13 +70,18 @@ def load_csv_from_github():
         return []
 
 def get_avg_goals(row) -> float:
-    # prova nomi tipici; fallback a 0.0
-    for k in ["Average Goals", "AVG Goals", "AvgGoals", "Avg Goals"]:
-        if k in row and row[k]:
-            try:
-                return float(row[k])
-            except Exception:
-                pass
+    keys = [
+        "Average Goals", "AVG Goals", "AvgGoals", "Avg Goals",
+        "Avg Total Goals", "Average Total Goals", "Avg_Total_Goals"
+    ]
+    for k in keys:
+        v = row.get(k)
+        if v is None or str(v).strip() == "":
+            continue
+        try:
+            return float(v)
+        except Exception:
+            continue
     return 0.0
 
 def filter_matches_by_avg(matches):
@@ -86,9 +93,11 @@ def filter_matches_by_avg(matches):
         except Exception:
             pass
     logger.info("Filtrati per AVG >= %.2f: %d", AVG_GOALS_THRESHOLD, len(out))
+    if DEBUG_LOG:
+        logger.info("Esempio AVG: %s", [get_avg_goals(x) for x in out[:5]])
     return out
 
-# ===== Live events (solo soccer) =====
+# ===== Live events =====
 def get_live_matches():
     url = f"{RAPIDAPI_BASE.rstrip('/')}/{RAPIDAPI_EVENTS_PATH.lstrip('/')}"
     headers = {"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": RAPIDAPI_HOST}
@@ -115,36 +124,48 @@ def get_live_matches():
     logger.info("API live-events: %d match live", len(events))
     return events
 
-# ===== Matching CSV vs Live =====
-def _norm(s): return (s or "").lower().strip()
+# ===== Team matching robusto =====
+STOPWORDS = {
+    "fc","cf","sc","ac","club","cd","de","del","da","do","d","u19","u20","u21","b","ii","iii",
+    "women","w","reserves","team","sv","afc","youth"
+}
 
-def _soft_team_match(a: str, b: str) -> bool:
-    def clean(x: str) -> str:
-        x = x.lower()
-        for junk in [" (w)", "(w)", " (u19)", "(u19)", " u19", " u20", " fc", " cf", ".", ","]:
-            x = x.replace(junk, "")
-        return " ".join(x.split())
-    A, B = clean(a), clean(b)
-    return A == B or A in B or B in A
+def strip_accents(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+
+def team_tokens(name: str) -> set[str]:
+    if not name:
+        return set()
+    s = strip_accents(name).lower()
+    s = re.sub(r"[’'`]", " ", s)
+    s = re.sub(r"\(.*?\)", " ", s)                 # rimuovi parentesi
+    s = re.sub(r"[^a-z0-9]+", " ", s)              # solo alfanumerico
+    toks = [t for t in s.split() if t and t not in STOPWORDS]
+    # rimuovi token troppo corti
+    toks = [t for t in toks if len(t) >= 3 or t.isdigit()]
+    return set(toks)
+
+def _soft_team_match(csv_name: str, live_name: str) -> bool:
+    A, B = team_tokens(csv_name), team_tokens(live_name)
+    if not A or not B:
+        return False
+    if A == B or A.issubset(B) or B.issubset(A):
+        return True
+    # almeno due token forti in comune (o uno se una delle due squadre è "mononimo", es. "Mouna")
+    inter = A & B
+    if len(A) == 1 or len(B) == 1:
+        return len(inter) >= 1
+    return len(inter) >= 2
 
 def match_teams(csv_match, live_match) -> bool:
-    csv_home = _norm(csv_match.get("Home Team") or csv_match.get("Home") or csv_match.get("home"))
-    csv_away = _norm(csv_match.get("Away Team") or csv_match.get("Away") or csv_match.get("away"))
-    live_home = _norm(live_match.get("home"))
-    live_away = _norm(live_match.get("away"))
-    if not (csv_home and csv_away and live_home and live_away):
-        return False
-    return _soft_team_match(csv_home, live_home) and _soft_team_match(csv_away, live_away)
+    csv_home = csv_match.get("Home Team") or csv_match.get("Home") or csv_match.get("home") or ""
+    csv_away = csv_match.get("Away Team") or csv_match.get("Away") or csv_match.get("away") or ""
+    return _soft_team_match(csv_home, live_match.get("home","")) and \
+           _soft_team_match(csv_away, live_match.get("away",""))
 
-# ===== Calcolo minuto dal kickoff CSV =====
+# ===== Minuto dal kickoff (CSV epoch UTC) =====
 def kickoff_minute_from_csv(csv_match) -> int | None:
-    """
-    Il CSV ha il kickoff in UTC come epoch (prima colonna nel tuo file, p.es. 1760544000).
-    Provo varie chiavi; se non trovo, provo la prima colonna.
-    """
-    candidate_keys = [
-        "timestamp","epoch","unix","Date Unix","Kickoff Unix","start_time","start","time_unix"
-    ]
+    candidate_keys = ["timestamp","epoch","unix","Date Unix","Kickoff Unix","start_time","start","time_unix"]
     epoch_val = None
 
     for k in candidate_keys:
@@ -156,9 +177,8 @@ def kickoff_minute_from_csv(csv_match) -> int | None:
                     break
             except Exception:
                 pass
-
     if epoch_val is None:
-        # fallback: prima colonna se è numerica (nel tuo CSV lo è)
+        # fallback: prima colonna se è numerica
         try:
             first_key = next(iter(csv_match.keys()))
             n = int(float(csv_match[first_key]))
@@ -166,13 +186,12 @@ def kickoff_minute_from_csv(csv_match) -> int | None:
                 epoch_val = n
         except Exception:
             pass
-
     if epoch_val is None:
         return None
 
     now_utc = datetime.now(timezone.utc).timestamp()
     minute = int(max(0, (now_utc - epoch_val) // 60))
-    if minute > 150:  # clamp prudenziale
+    if minute > 150:
         minute = 150
     return minute
 
@@ -193,10 +212,13 @@ def check_matches():
         logger.info("Nessun live attualmente"); return
 
     opportunities = 0
+    matched = 0
+
     for cm in filtered:
         for lm in live:
             if not match_teams(cm, lm):
                 continue
+            matched += 1
 
             score = lm.get("SS") or ""
             if score != "0-0":
@@ -206,14 +228,14 @@ def check_matches():
             if minute is None:
                 continue
 
-            logger.info("Match %s vs %s | %s | %d' | %s",
-                        lm.get('home'), lm.get('away'), score, minute, lm.get('league'))
+            if DEBUG_LOG:
+                logger.info("Abbinato: %s vs %s | %s | %d' | %s",
+                            lm.get('home'), lm.get('away'), score, minute, lm.get('league'))
 
             if minute >= CHECK_TIME_MINUTES:
                 key = f"{lm.get('home')}|{lm.get('away')}"
                 if key in notified_matches:
                     continue
-                opportunities += 1
                 avg = get_avg_goals(cm)
                 msg = (
                     "🚨 <b>SEGNALE OVER 1.5!</b>\n\n"
@@ -228,7 +250,7 @@ def check_matches():
                     notified_matches.add(key)
                     logger.info("Segnalato: %s", key)
 
-    logger.info("Opportunità trovate: %d", opportunities)
+    logger.info("Riepilogo: Abbinati CSV↔Live=%d | Opportunità=%d", matched, opportunities)
     logger.info("=" * 60)
 
 def main():
