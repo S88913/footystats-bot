@@ -1,484 +1,332 @@
-# src/bot.py
 import os
-import re
 import time
-import math
-import json
+import csv
+import re
 import unicodedata
+from io import StringIO
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional, Tuple
+from urllib.parse import parse_qsl
+from difflib import SequenceMatcher
 
+import logging
 import requests
-import pandas as pd
 
 # =========================
-# Lettura ENV / Parametri
+# Logging
 # =========================
-TELEGRAM_TOKEN            = os.getenv("TELEGRAM_TOKEN", "").strip()
-CHAT_ID                   = os.getenv("CHAT_ID", "").strip()
-
-GITHUB_CSV_URL            = os.getenv("GITHUB_CSV_URL", "").strip()
-
-AVG_GOALS_THRESHOLD       = float(os.getenv("AVG_GOALS_THRESHOLD", "2.5"))
-CHECK_TIME_MINUTES        = int(os.getenv("CHECK_TIME_MINUTES", "50"))   # tenuto per compatibilità, non usato direttamente
-CHECK_INTERVAL_SECONDS    = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
-
-# Finestra trigger
-MIN_MINUTE                = int(os.getenv("MIN_MINUTE", "50"))
-MAX_MINUTE                = int(os.getenv("MAX_MINUTE", "56"))
-
-# Filtri campionati / forma
-LEAGUE_MIN_AVG            = float(os.getenv("LEAGUE_MIN_AVG", "0"))  # opzionale, se presente in CSV
-TEAM_FORM_MIN_AVG         = float(os.getenv("TEAM_FORM_MIN_AVG", "0"))
-
-LEAGUE_BLACKLIST          = os.getenv("LEAGUE_BLACKLIST", "")
-LEAGUE_WHITELIST          = os.getenv("LEAGUE_WHITELIST", "").strip()  # opzionale
-
-# RapidAPI
-RAPIDAPI_BASE             = os.getenv("RAPIDAPI_BASE", "https://bet365data.p.rapidapi.com").rstrip("/")
-RAPIDAPI_HOST             = os.getenv("RAPIDAPI_HOST", "bet365data.p.rapidapi.com")
-RAPIDAPI_KEY              = os.getenv("RAPIDAPI_KEY", "")
-RAPIDAPI_EVENTS_PATH      = os.getenv("RAPIDAPI_EVENTS_PATH", "/live-events")
-RAPIDAPI_EVENTS_PARAMS    = os.getenv("RAPIDAPI_EVENTS_PARAMS", "sport=soccer")
-RAPIDAPI_MARKETS_PATH     = os.getenv("RAPIDAPI_MARKETS_PATH", "/live-events/{id}")  # non necessario per il tuo segnale, lasciato per future estensioni
-RAPIDAPI_MARKETS_ID_PARAM = os.getenv("RAPIDAPI_MARKETS_ID_PARAM", "id")
-
-SEND_STARTUP_MESSAGE      = os.getenv("SEND_STARTUP_MESSAGE", "1").strip() == "1"
-DEBUG_LOG                 = os.getenv("DEBUG_LOG", "0").strip() == "1"
-
-HEADERS_RAPIDAPI = {
-    "x-rapidapi-host": RAPIDAPI_HOST,
-    "x-rapidapi-key": RAPIDAPI_KEY,
-}
-
-# Stato per evitare duplicati
-already_notified: set = set()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("footystats-bot")
 
 # =========================
-# Utilità
+# Environment
 # =========================
-def log(level: str, msg: str) -> None:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{now} - {level.upper()} - {msg}", flush=True)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+CHAT_ID        = os.getenv("CHAT_ID", "")
 
-def normalize(s: str) -> str:
-    if s is None:
-        return ""
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = s.lower()
-    # rimuovi tag tipo (F), U19, ecc.
-    s = re.sub(r"\([^)]*\)", " ", s)
-    s = re.sub(r"\b(u19|u20|u21|u23|w|women|reserves?)\b", " ", s)
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
-    s = re.sub(r"\s+", " ", s)
-    return s.strip()
+RAPIDAPI_KEY   = os.getenv("RAPIDAPI_KEY", "")
+RAPIDAPI_HOST  = os.getenv("RAPIDAPI_HOST", "bet365data.p.rapidapi.com")
+RAPIDAPI_BASE  = os.getenv("RAPIDAPI_BASE", f"https://{RAPIDAPI_HOST}")
+RAPIDAPI_EVENTS_PATH   = os.getenv("RAPIDAPI_EVENTS_PATH", "/live-events")
+RAPIDAPI_EVENTS_PARAMS = dict(parse_qsl(os.getenv("RAPIDAPI_EVENTS_PARAMS", "sport=soccer")))
 
-def compile_pipe_regex(pipe_str: str) -> Optional[re.Pattern]:
-    pipe_str = (pipe_str or "").strip()
-    if not pipe_str:
-        return None
-    # Escapa ogni token e fai match case-insensitive in qualsiasi punto della stringa
-    tokens = [t.strip() for t in pipe_str.split("|") if t.strip()]
-    if not tokens:
-        return None
-    pattern = "|".join(re.escape(t) for t in tokens)
-    return re.compile(pattern, flags=re.IGNORECASE)
+GITHUB_CSV_URL      = os.getenv("GITHUB_CSV_URL", "")
+AVG_GOALS_THRESHOLD = float(os.getenv("AVG_GOALS_THRESHOLD", "2.5"))
+CHECK_TIME_MINUTES  = int(os.getenv("CHECK_TIME_MINUTES", "50"))
+CHECK_INTERVAL      = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
+LEAGUE_EXCLUDE_KEYWORDS = [kw.strip().lower() for kw in os.getenv(
+    "LEAGUE_EXCLUDE_KEYWORDS", "Esoccer,Volta,8 mins play,H2H GG"
+).split(",") if kw.strip()]
+SEND_STARTUP_MESSAGE = os.getenv("SEND_STARTUP_MESSAGE", "1") == "1"
+DEBUG_LOG = os.getenv("DEBUG_LOG", "0") == "1"
 
-RX_BLACK = compile_pipe_regex(LEAGUE_BLACKLIST)
-RX_WHITE = compile_pipe_regex(LEAGUE_WHITELIST)
+# Cache notifiche già inviate
+notified_matches: set[str] = set()
 
 # =========================
 # Telegram
 # =========================
-def send_telegram(text: str) -> None:
+def send_telegram_message(message: str) -> bool:
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        log("WARN", "Telegram non configurato: salta invio messaggio")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
+        logger.error("TELEGRAM_TOKEN/CHAT_ID mancanti.")
+        return False
     try:
-        r = requests.post(url, json=payload, timeout=20)
-        if r.status_code // 100 == 2:
-            if DEBUG_LOG:
-                log("DEBUG", f"Telegram OK: {r.status_code}")
-        else:
-            log("ERROR", f"Telegram errore HTTP {r.status_code}: {r.text[:200]}")
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        r = requests.post(url, data={"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=15)
+        if r.ok:
+            logger.info("Telegram: messaggio inviato")
+            return True
+        logger.error("Telegram %s: %s", r.status_code, r.text)
     except Exception as e:
-        log("ERROR", f"Telegram eccezione: {e}")
+        logger.exception("Telegram exception: %s", e)
+    return False
 
 # =========================
-# CSV Footystats
+# HTTP helper
 # =========================
-def read_csv(url: str) -> pd.DataFrame:
-    df = pd.read_csv(url)
-    # uniforma nomi colonne più comuni
-    cols = {c.lower(): c for c in df.columns}
-    # cerca colonne team/league/avg più probabili
-    # (il CSV FootyStats può avere molte varianti: gestiamo le più comuni)
-    expected = {
-        "home": ["home", "home_team", "team_home", "Home Team", "Home"],
-        "away": ["away", "away_team", "team_away", "Away Team", "Away"],
-        "league": ["league", "competition", "league_name", "Country & League"],
-        "avg": ["avg", "avg_goals", "avg_total_goals", "Avg Total Goals", "Average Total Goals"],
-        "kickoff": ["kickoff", "start_time", "date", "timestamp"],
-        # opzionale: forme
-        "home_form": ["home_form_avg", "home_form_last5", "home_last5_avg"],
-        "away_form": ["away_form_avg", "away_form_last5", "away_last5_avg"],
-        "league_avg": ["league_avg", "league_avg_goals"],
-    }
-
-    # mappa scelte reali -> alias standard
-    rename_map = {}
-
-    def pick(colnames: List[str]) -> Optional[str]:
-        for name in colnames:
-            key = name.lower()
-            if key in cols:
-                return cols[key]
+def http_get(url, headers=None, params=None, timeout=25):
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=timeout)
+        if not r.ok:
+            logger.error("HTTP %s %s | body: %s", r.status_code, url, r.text[:300])
+        return r
+    except Exception as e:
+        logger.error("HTTP exception on %s: %s", url, e)
         return None
 
-    chosen = {k: pick(v) for k, v in expected.items()}
+# =========================
+# CSV
+# =========================
+def load_csv_from_github():
+    try:
+        logger.info("Scarico CSV: %s", GITHUB_CSV_URL)
+        r = requests.get(GITHUB_CSV_URL, timeout=30)
+        r.raise_for_status()
+        rows = list(csv.DictReader(StringIO(r.text)))
+        logger.info("CSV caricato (%d righe)", len(rows))
+        return rows
+    except Exception as e:
+        logger.exception("Errore caricamento CSV: %s", e)
+        return []
 
-    # rinomina ciò che troviamo
-    for std, real in chosen.items():
-        if real:
-            rename_map[real] = std
+def get_avg_goals(row) -> float:
+    keys = [
+        "Average Goals", "AVG Goals", "AvgGoals", "Avg Goals",
+        "Avg Total Goals", "Average Total Goals", "Avg_Total_Goals"
+    ]
+    for k in keys:
+        v = row.get(k)
+        if v is None or str(v).strip() == "":
+            continue
+        try:
+            return float(str(v).replace(",", "."))
+        except Exception:
+            continue
+    return 0.0
 
-    if rename_map:
-        df = df.rename(columns=rename_map)
-
-    # normalizza stringhe chiave
-    for col in ["home", "away", "league"]:
-        if col in df.columns:
-            df[col] = df[col].astype(str).fillna("").map(str).map(lambda x: x.strip())
-
-    # forza numerici dove possibile
-    for col in ["avg", "league_avg", "home_form", "away_form"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    return df
-
-def lookup_match_avg(df: pd.DataFrame, league: str, home: str, away: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """Ritorna (avg_tot_goals, home_form, away_form) se matchato, altrimenti (None,None,None)."""
-    if df is None or df.empty:
-        return (None, None, None)
-
-    # Filtra per lega se presente
-    sub = df
-    if "league" in df.columns and league:
-        # match soft sulla lega
-        n_lg = normalize(league)
-        sub = df[df["league"].map(lambda x: normalize(str(x)) == n_lg)] or df
-
-    # match per nomi squadre normalizzati (ordine irrilevante, ma proviamo diretto)
-    n_home = normalize(home)
-    n_away = normalize(away)
-
-    def rows_match(r) -> bool:
-        h = normalize(str(r.get("home", "")))
-        a = normalize(str(r.get("away", "")))
-        return (h == n_home and a == n_away) or (h == n_away and a == n_home)
-
-    cand = sub[sub.apply(rows_match, axis=1)]
-    if cand.empty and "league" in df.columns:
-        # se non ha matchato, prova su tutto df (magari la lega diverge di stringa)
-        cand = df[df.apply(rows_match, axis=1)]
-
-    if cand.empty:
-        return (None, None, None)
-
-    row = cand.iloc[0]
-    avg = float(row["avg"]) if "avg" in row and pd.notna(row["avg"]) else None
-    hf  = float(row["home_form"]) if "home_form" in row and pd.notna(row["home_form"]) else None
-    af  = float(row["away_form"]) if "away_form" in row and pd.notna(row["away_form"]) else None
-    return (avg, hf, af)
+def filter_matches_by_avg(matches):
+    out = []
+    for m in matches:
+        try:
+            if get_avg_goals(m) >= AVG_GOALS_THRESHOLD:
+                out.append(m)
+        except Exception:
+            pass
+    logger.info("Filtrati per AVG >= %.2f: %d", AVG_GOALS_THRESHOLD, len(out))
+    return out
 
 # =========================
-# RapidAPI: Live Events
+# Live events (RapidAPI)
 # =========================
-def fetch_live_events() -> List[Dict[str, Any]]:
-    """Chiama /live-events, gestendo formati eterogenei, e ritorna solo eventi in forma dict."""
-    url = f"{RAPIDAPI_BASE}{RAPIDAPI_EVENTS_PATH}"
-    params: Dict[str, str] = {}
-    if RAPIDAPI_EVENTS_PARAMS:
-        for p in RAPIDAPI_EVENTS_PARAMS.split("&"):
-            if "=" in p:
-                k, v = p.split("=", 1)
-                params[k.strip()] = v.strip()
-
-    if DEBUG_LOG:
-        log("DEBUG", f"Chiamo live-events: {url} {params}")
-
-    r = requests.get(url, headers=HEADERS_RAPIDAPI, params=params, timeout=25)
-    r.raise_for_status()
-    data = r.json()
-
-    # Normalizza: l'API può restituire dict o list
-    if isinstance(data, list):
-        events = data
-    elif isinstance(data, dict):
-        events = data.get("data") or data.get("events") or data.get("results") or []
-    else:
-        events = []
-
-    # Tieni solo dict validi
-    events = [ev for ev in events if isinstance(ev, dict)]
-    log("INFO", f"API live-events: {len(events)} match live")
+def get_live_matches():
+    url = f"{RAPIDAPI_BASE.rstrip('/')}/{RAPIDAPI_EVENTS_PATH.lstrip('/')}"
+    headers = {"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": RAPIDAPI_HOST}
+    r = http_get(url, headers=headers, params=RAPIDAPI_EVENTS_PARAMS, timeout=25)
+    if not r or not r.ok:
+        return []
+    try:
+        data = r.json() or {}
+    except Exception:
+        logger.error("Response non-JSON: %s", r.text[:300]); return []
+    root = data.get("data") or {}
+    raw = root.get("events") or []
+    events = []
+    for it in raw:
+        league = (it.get("league") or it.get("CT") or "N/A").strip()
+        if any(ex in league.lower() for ex in LEAGUE_EXCLUDE_KEYWORDS):
+            continue
+        events.append({
+            "home": (it.get("home") or "").strip(),
+            "away": (it.get("away") or "").strip(),
+            "league": league,
+            "SS": (it.get("SS") or "").strip(),  # es. "0-0"
+        })
+    logger.info("API live-events: %d match live", len(events))
     return events
 
-def safe_get(d: Dict[str, Any], *path, default=None):
-    cur = d
-    for key in path:
-        if isinstance(cur, dict) and key in cur:
-            cur = cur[key]
-        else:
-            return default
-    return cur
+# =========================
+# Matching nomi squadre
+# =========================
+STOPWORDS = {
+    "fc","cf","sc","ac","club","cd","de","del","da","do","d","u19","u20","u21","u23",
+    "b","ii","iii","women","w","reserves","team","sv","afc","youth","if","fk"
+}
 
-def extract_event_fields(ev: Dict[str, Any]) -> Tuple[str, str, str, int, int, Optional[int], str]:
-    """
-    Estrae: (event_id, home_name, away_name, home_score, away_score, kickoff_epoch_utc, league_name)
-    Gestisce varie strutture comuni in RapidAPI/Bet365.
-    """
-    eid = str(ev.get("id") or ev.get("event_id") or ev.get("uid") or "")
-    league = (
-        safe_get(ev, "league", "name")
-        or ev.get("league_name")
-        or safe_get(ev, "tournament", "name")
-        or ev.get("competition")
-        or ""
-    )
-    # nomi squadre
-    home = (
-        safe_get(ev, "home", "name")
-        or safe_get(ev, "teams", "home", "name")
-        or ev.get("homeTeam")
-        or ev.get("home_name")
-        or ev.get("home")
-        or ""
-    )
-    away = (
-        safe_get(ev, "away", "name")
-        or safe_get(ev, "teams", "away", "name")
-        or ev.get("awayTeam")
-        or ev.get("away_name")
-        or ev.get("away")
-        or ""
-    )
+def strip_accents(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", s or "") if not unicodedata.combining(c))
 
-    # punteggio
-    hs = (
-        safe_get(ev, "state", "homeScore")
-        or safe_get(ev, "score", "home")
-        or safe_get(ev, "scores", "home")
-        or ev.get("homeScore")
-        or 0
-    )
-    as_ = (
-        safe_get(ev, "state", "awayScore")
-        or safe_get(ev, "score", "away")
-        or safe_get(ev, "scores", "away")
-        or ev.get("awayScore")
-        or 0
-    )
-    try:
-        hs = int(hs)
-    except Exception:
-        hs = 0
-    try:
-        as_ = int(as_)
-    except Exception:
-        as_ = 0
+def norm_text(s: str) -> str:
+    s = strip_accents(s).lower()
+    s = re.sub(r"\(.*?\)", " ", s)          # rimuovi parentesi (es. "(F)")
+    s = re.sub(r"[’'`]", " ", s)
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return " ".join(s.split())
 
-    # kickoff epoch (UTC)
-    kickoff = (
-        ev.get("kickoff")
-        or ev.get("startTime")
-        or safe_get(ev, "timer", "start")     # in secondi
-        or safe_get(ev, "time", "kickoff")
-        or None
-    )
-    # normalizza a int epoch secondi se possibile
-    ko_epoch = None
-    if isinstance(kickoff, (int, float)):
-        # se è ragionevole (< 10^12), consideralo già in secondi
-        ko_epoch = int(kickoff) if kickoff < 10**12 else int(kickoff // 1000)
-    elif isinstance(kickoff, str):
-        # prova a parse unix string
-        if kickoff.isdigit():
-            val = int(kickoff)
-            ko_epoch = val if val < 10**12 else val // 1000
-        else:
-            # ISO8601
+def team_tokens(name: str) -> set[str]:
+    toks = [t for t in norm_text(name).split() if t and t not in STOPWORDS]
+    toks = [t for t in toks if len(t) >= 3 or t.isdigit()]
+    return set(toks)
+
+def token_match(a: str, b: str) -> bool:
+    A, B = team_tokens(a), team_tokens(b)
+    if not A or not B:
+        return False
+    if A == B or A.issubset(B) or B.issubset(A):
+        return True
+    inter = A & B
+    if len(A) == 1 or len(B) == 1:
+        return len(inter) >= 1
+    return len(inter) >= 2
+
+def fuzzy_ratio(a: str, b: str) -> float:
+    return SequenceMatcher(None, norm_text(a), norm_text(b)).ratio()
+
+def match_teams(csv_match, live_match) -> bool:
+    csv_home = csv_match.get("Home Team") or csv_match.get("Home") or csv_match.get("home") or ""
+    csv_away = csv_match.get("Away Team") or csv_match.get("Away") or csv_match.get("away") or ""
+    live_home = live_match.get("home","")
+    live_away = live_match.get("away","")
+
+    # 1) match per token (veloce/robusto)
+    if token_match(csv_home, live_home) and token_match(csv_away, live_away):
+        return True
+
+    # 2) fallback fuzzy per casi tipo "Gyori ETO" vs "Gyor Eto FC", "MTK" vs "MTK Budapest"
+    rh = fuzzy_ratio(csv_home, live_home)
+    ra = fuzzy_ratio(csv_away, live_away)
+    if (rh >= 0.72 and ra >= 0.60) or (rh >= 0.60 and ra >= 0.72):
+        return True
+
+    return False
+
+# =========================
+# Minuti trascorsi dal kickoff (da CSV)
+# =========================
+def kickoff_minute_from_csv(csv_match) -> int | None:
+    # preferisci un epoch/UNIX se presente (come prima colonna nel tuo CSV)
+    candidate_keys = [
+        "timestamp","epoch","unix","Date Unix","Kickoff Unix","start_time","start","time_unix"
+    ]
+    epoch_val = None
+
+    for k in candidate_keys:
+        if k in csv_match and str(csv_match[k]).strip():
             try:
-                dt = datetime.fromisoformat(kickoff.replace("Z", "+00:00"))
-                ko_epoch = int(dt.timestamp())
+                n = int(float(str(csv_match[k]).strip()))
+                if n >= 1_000_000_000:
+                    epoch_val = n
+                    break
             except Exception:
-                ko_epoch = None
+                pass
 
-    return eid, str(home), str(away), hs, as_, ko_epoch, str(league)
-
-def get_elapsed_minutes(ev: Dict[str, Any], ko_epoch: Optional[int]) -> Optional[int]:
-    """Ritorna i minuti trascorsi: prima prova dai campi 'timer', altrimenti da kickoff epoch."""
-    # 1) minute esplicito
-    cand = (
-        safe_get(ev, "time", "minute")
-        or safe_get(ev, "clock", "minute")
-        or safe_get(ev, "timer", "minute")
-        or ev.get("minute")
-    )
-    if cand is not None:
+    # fallback: prova la prima colonna se è un numero plausibile
+    if epoch_val is None:
         try:
-            return int(cand)
+            first_key = next(iter(csv_match.keys()))
+            n = int(float(str(csv_match[first_key]).strip()))
+            if n >= 1_000_000_000:
+                epoch_val = n
         except Exception:
             pass
 
-    # 2) elapsed dal kickoff
-    if ko_epoch:
-        now = int(datetime.now(timezone.utc).timestamp())
-        if now > ko_epoch:
-            return (now - ko_epoch) // 60
-    return None
+    if epoch_val is None:
+        return None
+
+    now_utc = datetime.now(timezone.utc).timestamp()
+    minute = int(max(0, (now_utc - epoch_val) // 60))
+    if minute > 180:
+        minute = 180
+    return minute
 
 # =========================
-# Logica filtro e segnale
+# Business logic
 # =========================
-def league_allowed(league_name: str) -> bool:
-    if RX_WHITE and not RX_WHITE.search(league_name):
+def is_score_00(score: str) -> bool:
+    """True se score indica 0-0 (gestisce '0-0', '0 - 0', '0–0' ecc.)."""
+    if not score:
         return False
-    if RX_BLACK and RX_BLACK.search(league_name):
-        return False
-    return True
+    digits = re.sub(r"\D", "", score)  # keep only digits
+    return digits == "00"
 
-def event_to_signal_text(league: str, home: str, away: str, minute: int, avg: float) -> str:
-    # Messaggio coerente con il tuo formato
-    lines = [
-        "🚨 <b>SEGNALE OVER 1.5!</b>",
-        f"⚽ <b>{home}</b> vs <b>{away}</b>",
-        f"🏆 {league}",
-        f"📊 AVG Goals: <b>{avg:.2f}</b>",
-        f"🕒 {minute}' - Risultato: 0-0",
-        "✅ Controlla Bet365 Live!",
-        "",
-        "🎯 <b>Punta Over 1.5 FT</b>",
-    ]
-    return "\n".join(lines)
+def check_matches():
+    logger.info("=" * 60)
+    logger.info("INIZIO CONTROLLO")
+    logger.info("=" * 60)
 
-def process_once(df: pd.DataFrame) -> None:
-    # Scarica eventi live
-    events = fetch_live_events()
-    if not events:
+    csv_matches = load_csv_from_github()
+    if not csv_matches:
+        logger.warning("CSV vuoto")
         return
 
-    for ev in events:
-        try:
-            eid, home, away, hs, as_, ko_epoch, league = extract_event_fields(ev)
+    filtered = filter_matches_by_avg(csv_matches)
+    if not filtered:
+        logger.info("Nessun match con AVG >= soglia")
+        return
 
-            if not home or not away or not league:
-                if DEBUG_LOG:
-                    log("DEBUG", f"Skip evento incompleto: {ev}")
+    live = get_live_matches()
+    if not live:
+        logger.info("Nessun live attualmente")
+        return
+
+    matched = 0
+    opportunities = 0
+
+    for cm in filtered:
+        for lm in live:
+            if not match_teams(cm, lm):
+                continue
+            matched += 1
+
+            score = lm.get("SS") or ""
+            if not is_score_00(score):
                 continue
 
-            if not league_allowed(league):
-                if DEBUG_LOG:
-                    log("DEBUG", f"Skip lega (blacklist/whitelist): {league} | teams={home}-{away}")
-                continue
-
-            # punteggio deve essere 0-0
-            if hs != 0 or as_ != 0:
-                if DEBUG_LOG:
-                    log("DEBUG", f"Skip punteggio {home}-{away} {hs}-{as_}")
-                continue
-
-            # minuti
-            minute = get_elapsed_minutes(ev, ko_epoch)
+            minute = kickoff_minute_from_csv(cm)
             if minute is None:
-                if DEBUG_LOG:
-                    log("DEBUG", f"Nessun minuto disponibile per {home} vs {away} (ID {eid})")
                 continue
 
-            if minute < MIN_MINUTE or minute > MAX_MINUTE:
-                if DEBUG_LOG:
-                    log("DEBUG", f"Fuori finestra minuto {minute} per {home}-{away}")
-                continue
+            if DEBUG_LOG:
+                logger.info("Abbinato: %s vs %s | %s | %d' | %s",
+                            lm.get('home'), lm.get('away'), score, minute, lm.get('league'))
 
-            # lookup AVG dal CSV
-            avg, hf, af = lookup_match_avg(df, league, home, away)
-            if avg is None:
-                if DEBUG_LOG:
-                    log("DEBUG", f"AVG non trovato su CSV per {home} vs {away} | {league}")
-                continue
-
-            if avg < AVG_GOALS_THRESHOLD:
-                if DEBUG_LOG:
-                    log("DEBUG", f"AVG {avg:.2f} < soglia {AVG_GOALS_THRESHOLD:.2f} per {home}-{away}")
-                continue
-
-            # opzionale: forma squadre se disponibile nel CSV
-            if TEAM_FORM_MIN_AVG > 0:
-                ok_form = True
-                if hf is not None and hf < TEAM_FORM_MIN_AVG:
-                    ok_form = False
-                if af is not None and af < TEAM_FORM_MIN_AVG:
-                    ok_form = False
-                if not ok_form:
-                    if DEBUG_LOG:
-                        log("DEBUG", f"Forma insufficiente ({hf}, {af}) per {home}-{away}")
+            if minute >= CHECK_TIME_MINUTES:
+                key = f"{lm.get('home')}|{lm.get('away')}"
+                if key in notified_matches:
                     continue
 
-            # evita doppioni
-            dedup_key = f"{normalize(league)}|{normalize(home)}|{normalize(away)}"
-            if dedup_key in already_notified:
-                continue
-            already_notified.add(dedup_key)
+                avg = get_avg_goals(cm)
+                msg = (
+                    "🚨 <b>SEGNALE OVER 1.5!</b>\n\n"
+                    f"⚽ <b>{lm.get('home')} vs {lm.get('away')}</b>\n"
+                    f"🏆 {lm.get('league', 'N/A')}\n"
+                    f"📊 AVG Goals: <b>{avg:.2f}</b>\n"
+                    f"⏱️ <b>{minute}'</b> - Risultato: <b>{score}</b>\n"
+                    "✅ Controlla Bet365 Live!\n\n"
+                    "🎯 <b>Punta Over 1.5 FT</b>"
+                )
+                if send_telegram_message(msg):
+                    notified_matches.add(key)
+                    opportunities += 1
 
-            # invia segnale
-            text = event_to_signal_text(league, home, away, minute, avg)
-            send_telegram(text)
-            log("INFO", f"Segnale inviato: {home} vs {away} | {league} | {minute}' | AVG {avg:.2f}")
+    logger.info("Riepilogo: Abbinati CSV↔Live=%d | Opportunità=%d", matched, opportunities)
+    logger.info("=" * 60)
 
-        except Exception as e:
-            log("ERROR", f"Errore su evento: {e}")
-
-# =========================
-# Main loop
-# =========================
 def main():
+    logger.info("Bot avviato")
+    logger.info("Soglia AVG: %.2f | Minuti check: %d", AVG_GOALS_THRESHOLD, CHECK_TIME_MINUTES)
     if SEND_STARTUP_MESSAGE:
-        try:
-            send_telegram("🤖 FootyStats Bot avviato\nMonitoraggio partite in corso…")
-        except Exception:
-            pass
-
-    log("INFO", f"Soglia AVG: {AVG_GOALS_THRESHOLD:.2f} | Minuti check: {MIN_MINUTE}-{MAX_MINUTE}")
+        send_telegram_message("🤖 <b>FootyStats Bot avviato</b>\nMonitoraggio partite in corso…")
 
     while True:
         try:
-            log("INFO", "==============================")
-            log("INFO", "INIZIO CONTROLLO")
-            log("INFO", "==============================")
-
-            # carica CSV
-            log("INFO", f"Scarico CSV: {GITHUB_CSV_URL}")
-            df = read_csv(GITHUB_CSV_URL)
-            log("INFO", f"CSV caricato ({len(df)} righe)")
-
-            process_once(df)
-
-        except requests.HTTPError as e:
-            log("ERROR", f"Errore HTTP: {e}")
+            check_matches()
+            logger.info("Sleep %ds…", CHECK_INTERVAL)
+            time.sleep(CHECK_INTERVAL)
+        except KeyboardInterrupt:
+            send_telegram_message("⛔ Bot arrestato")
+            break
         except Exception as e:
-            log("ERROR", f"Errore generico: {e}")
-
-        log("INFO", f"Sleep {CHECK_INTERVAL_SECONDS}s…")
-        time.sleep(CHECK_INTERVAL_SECONDS)
+            logger.exception("Errore loop principale: %s", e)
+            time.sleep(60)
 
 if __name__ == "__main__":
     main()
