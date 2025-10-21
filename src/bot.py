@@ -1,400 +1,435 @@
 # src/bot.py
 import os
-import time
-import math
 import re
+import time
+import csv
+import unicodedata
 import requests
-import pandas as pd
+from io import StringIO
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
 
-# -----------------------------
-# Lettura ENV (usa valori sicuri di default)
-# -----------------------------
+# =========================
+# ENV
+# =========================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
 GITHUB_CSV_URL = os.getenv("GITHUB_CSV_URL", "").strip()
 
-AVG_GOALS_THRESHOLD = float(os.getenv("AVG_GOALS_THRESHOLD", os.getenv("LEAGUE_MIN_AVG", "2.5")))
-MIN_MINUTE = int(os.getenv("MIN_MINUTE", "50"))
-MAX_MINUTE = int(os.getenv("MAX_MINUTE", "56"))
-
+AVG_GOALS_THRESHOLD    = float(os.getenv("AVG_GOALS_THRESHOLD", "2.5"))
+CHECK_TIME_MINUTES     = int(os.getenv("CHECK_TIME_MINUTES", "50"))   # tuo requisito: inviare a ~50'
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
-SEND_STARTUP_MESSAGE = os.getenv("SEND_STARTUP_MESSAGE", "1").strip() == "1"
-DEBUG_LOG = os.getenv("DEBUG_LOG", "0").strip() == "1"
 
-# RapidAPI (Bet365)
-RAPIDAPI_BASE = os.getenv("RAPIDAPI_BASE", "https://bet365data.p.rapidapi.com").rstrip("/")
-RAPIDAPI_EVENTS_PATH = os.getenv("RAPIDAPI_EVENTS_PATH", "/live-events")
+# RapidAPI (Bet365Data)
+RAPIDAPI_BASE          = os.getenv("RAPIDAPI_BASE", "https://bet365data.p.rapidapi.com").rstrip("/")
+RAPIDAPI_EVENTS_PATH   = os.getenv("RAPIDAPI_EVENTS_PATH", "/live-events")
 RAPIDAPI_EVENTS_PARAMS = os.getenv("RAPIDAPI_EVENTS_PARAMS", "sport=soccer")
-RAPIDAPI_HOST = os.getenv("RAPIDAPI_HOST", "bet365data.p.rapidapi.com")
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")
+RAPIDAPI_HOST          = os.getenv("RAPIDAPI_HOST", "bet365data.p.rapidapi.com")
+RAPIDAPI_KEY           = os.getenv("RAPIDAPI_KEY", "")
 
-# Filtri leghe
-LEAGUE_BLACKLIST = os.getenv("LEAGUE_BLACKLIST", "")
-LEAGUE_WHITELIST = os.getenv("LEAGUE_WHITELIST", "").strip()
-EXCLUDE_KEYWORDS = os.getenv("LEAGUE_EXCLUDE_KEYWORDS", "Esoccer,Volta,8 mins play,H2H GG,Futsal,Beach,Penalty,Esports").strip()
+# Filtri leghe (facoltativi)
+EXCLUDE_KEYWORDS = [k.strip() for k in os.getenv(
+    "LEAGUE_EXCLUDE_KEYWORDS",
+    "Esoccer,Volta,8 mins play,H2H GG,Futsal,Beach,Penalty,Esports"
+).split(",") if k.strip()]
 
-# -----------------------------
-# Utils
-# -----------------------------
-def log(level: str, msg: str):
-    print(f"{datetime.now():%Y-%m-%d %H:%M:%S} - {level} - {msg}")
+SEND_STARTUP_MESSAGE = os.getenv("SEND_STARTUP_MESSAGE", "1").strip() == "1"
+DEBUG_LOG            = os.getenv("DEBUG_LOG", "0").strip() == "1"
 
-def dlog(msg: str):
+# =========================
+# Log helpers
+# =========================
+def log(msg: str) -> None:
+    print(f"{datetime.now():%Y-%m-%d %H:%M:%S} - INFO - {msg}", flush=True)
+
+def dlog(msg: str) -> None:
     if DEBUG_LOG:
-        log("DEBUG", msg)
+        print(f"{datetime.now():%Y-%m-%d %H:%M:%S} - DEBUG - {msg}", flush=True)
 
-def normalize_name(s: str) -> str:
-    if not isinstance(s, str):
+# =========================
+# Utils
+# =========================
+def normalize(s: str) -> str:
+    if not s:
         return ""
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = s.lower()
-    s = re.sub(r"\(w\)|\(f\)|\(u\d{2}\)|\(res\)|\(women\)|\(men\)", "", s)
-    s = re.sub(r"[^a-z0-9]+", " ", s).strip()
-    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"\([^)]*\)", " ", s)         # rimuovi (U19), (W), (Res), ecc.
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def telegram_send(text: str):
+def send_telegram(text: str) -> None:
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        log("WARN", "TELEGRAM_TOKEN/CHAT_ID mancanti—salto invio.")
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        r = requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=15)
-        r.raise_for_status()
-        dlog("Telegram: messaggio inviato")
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, json={
+            "chat_id": CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
+        }, timeout=20)
     except Exception as e:
-        log("ERROR", f"Telegram error: {e}")
+        log(f"Telegram error: {e}")
 
-def compute_match_minute(start_epoch: Optional[int]) -> Optional[int]:
+def league_allowed(league: str) -> bool:
+    if not league:
+        return True
+    l = league.lower()
+    return not any(k.lower() in l for k in EXCLUDE_KEYWORDS)
+
+# =========================
+# CSV loader (senza pandas)
+# Supporta sia CSV con header che "grezzi"
+# =========================
+def fetch_csv_rows(url: str) -> List[Dict[str, Any]]:
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    text = r.text
+
+    # 1) prova come CSV con header
+    try:
+        reader = csv.DictReader(StringIO(text))
+        rows = list(reader)
+        # Se ha header sensati, tienilo
+        if reader.fieldnames and len(reader.fieldnames) >= 4:
+            dlog(f"CSV header: {reader.fieldnames}")
+            return rows
+    except Exception:
+        pass
+
+    # 2) fallback: senza header -> parse manuale con indici
+    rows_out = []
+    simple_reader = csv.reader(StringIO(text))
+    for fields in simple_reader:
+        if not fields or len(fields) < 6:
+            continue
+        # euristiche sugli indici frequenti visti nei tuoi CSV:
+        # 0=epoch, 3=league, 4=home, 5=away, avg: cerchiamo un valore numerico plausibile in range 0.3..7
+        try:
+            epoch = int(fields[0])
+        except Exception:
+            epoch = None
+
+        league = str(fields[3]).strip() if len(fields) > 3 else ""
+        home   = str(fields[4]).strip() if len(fields) > 4 else ""
+        away   = str(fields[5]).strip() if len(fields) > 5 else ""
+
+        avg = None
+        # prova a scorrere le colonne alla ricerca di una media plausibile
+        for v in fields:
+            try:
+                x = float(v)
+                if 0.3 <= x <= 7.0:
+                    avg = x
+                    break
+            except Exception:
+                continue
+
+        rows_out.append({
+            "epoch": epoch,
+            "league": league,
+            "home": home,
+            "away": away,
+            "avg": avg
+        })
+    return rows_out
+
+def extract_match_fields(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    # supporta sia DictReader (header) che parse manuale
+    epoch = None
+    league = ""
+    home = ""
+    away = ""
+    avg = None
+
+    # epoch
+    for k in ("epoch", "timestamp", "kickoff_ts", "ts"):
+        if k in row and row[k] not in ("", None):
+            try:
+                epoch = int(row[k])
+                break
+            except Exception:
+                pass
+    if epoch is None:
+        # a volte la prima colonna è '1761065100' ma senza chiave; prova _rowid/0
+        for k in row.keys():
+            # tenta su tutte le chiavi se il valore è int-like lungo
+            try:
+                v = int(row[k])
+                if v > 1_600_000_000:
+                    epoch = v
+                    break
+            except Exception:
+                continue
+
+    # league
+    for k in ("league", "competition", "Country & League"):
+        if k in row and row[k]:
+            league = str(row[k]).strip()
+            break
+
+    # home/away
+    for k in ("home", "home_team", "Home Team", "Home"):
+        if k in row and row[k]:
+            home = str(row[k]).strip()
+            break
+    for k in ("away", "away_team", "Away Team", "Away"):
+        if k in row and row[k]:
+            away = str(row[k]).strip()
+            break
+
+    # avg
+    for k in ("avg", "Avg Total Goals", "Average Total Goals", "Average Goals"):
+        if k in row and row[k] not in ("", None):
+            try:
+                avg = float(row[k])
+                break
+            except Exception:
+                pass
+    if avg is None:
+        # euristica su tutti i valori
+        for v in row.values():
+            try:
+                x = float(v)
+                if 0.3 <= x <= 7.0:
+                    avg = x
+                    break
+            except Exception:
+                continue
+
+    if not home or not away or avg is None:
+        return None
+
+    return {"epoch": epoch, "league": league, "home": home, "away": away, "avg": avg}
+
+# =========================
+# RapidAPI live events
+# =========================
+HEADERS_RAPIDAPI = {
+    "x-rapidapi-host": RAPIDAPI_HOST,
+    "x-rapidapi-key": RAPIDAPI_KEY,
+}
+
+def parse_params(qs: str) -> Dict[str, str]:
+    params: Dict[str, str] = {}
+    if not qs:
+        return params
+    for p in qs.split("&"):
+        if "=" in p:
+            k, v = p.split("=", 1)
+            params[k.strip()] = v.strip()
+    return params
+
+def fetch_live_events() -> List[Dict[str, Any]]:
+    url = f"{RAPIDAPI_BASE}{RAPIDAPI_EVENTS_PATH}"
+    params = parse_params(RAPIDAPI_EVENTS_PARAMS)
+    r = requests.get(url, headers=HEADERS_RAPIDAPI, params=params, timeout=25)
+    r.raise_for_status()
+    data = r.json()
+
+    # l'API può restituire direttamente una lista o {"data":[...]}
+    if isinstance(data, dict) and "data" in data:
+        data = data["data"]
+    if not isinstance(data, list):
+        return []
+
+    events: List[Dict[str, Any]] = []
+    for ev in data:
+        try:
+            league = (
+                ev.get("league")
+                or ev.get("league_name")
+                or (ev.get("tournament") or {}).get("name")
+                or ev.get("competition")
+                or ""
+            )
+            home = (ev.get("home") or ev.get("homeTeam") or ev.get("home_name") or "")
+            away = (ev.get("away") or ev.get("awayTeam") or ev.get("away_name") or "")
+
+            # punteggio
+            home_goals = 0
+            away_goals = 0
+            score = ev.get("score")
+            if isinstance(score, dict):
+                home_goals = int(score.get("home", 0) or 0)
+                away_goals = int(score.get("away", 0) or 0)
+            elif isinstance(score, str) and "-" in score:
+                try:
+                    s1, s2 = score.split("-", 1)
+                    home_goals = int(s1.strip()); away_goals = int(s2.strip())
+                except Exception:
+                    pass
+            else:
+                home_goals = int(ev.get("homeScore", ev.get("home_score", 0)) or 0)
+                away_goals = int(ev.get("awayScore", ev.get("away_score", 0)) or 0)
+
+            # minuto (se presente) e sanificazione 0..130
+            minute = None
+            for k in ("minute",):
+                if k in ev and ev[k] not in (None, ""):
+                    try:
+                        minute = int(ev[k])
+                    except Exception:
+                        minute = None
+            if minute is not None and not (0 <= minute <= 130):
+                minute = None
+
+            events.append({
+                "league": str(league),
+                "home": str(home),
+                "away": str(away),
+                "home_goals": int(home_goals),
+                "away_goals": int(away_goals),
+                "minute": minute
+            })
+        except Exception:
+            continue
+
+    return events
+
+# =========================
+# Live detection & minute calc (anti-180')
+# =========================
+def event_is_inplay(ev: Dict[str, Any]) -> bool:
     """
-    Calcola il minuto dal kickoff (epoch in secondi, UTC).
-    Ritorna None se kickoff nel futuro o minuto fuori range plausibile 0..130.
+    Prova a capire se l'evento è davvero live.
+    In questa versione "base" sfruttiamo solo il fatto che l'API 'live-events'
+    dovrebbe già essere live; lasciamo qui una funzione estendibile.
     """
-    if not start_epoch:
+    # Se servisse, qui potresti controllare campi tipo status/inPlay ecc.
+    return True
+
+def compute_minute_from_kickoff(epoch: Optional[int]) -> Optional[int]:
+    """
+    Calcola minuto dal kickoff epoch. Ritorna None se:
+      - kickoff nel futuro
+      - valore fuori 0..130
+    """
+    if not epoch:
         return None
     try:
-        kick = datetime.fromtimestamp(int(start_epoch), tz=timezone.utc)
+        kick = datetime.fromtimestamp(int(epoch), tz=timezone.utc)
     except Exception:
         return None
     now = datetime.now(timezone.utc)
     if now < kick:
         return None
     m = int((now - kick).total_seconds() // 60)
-    if m < 0 or m > 130:
-        return None
-    return m
-
-# -----------------------------
-# CSV handling (tollerante)
-# -----------------------------
-CSV_COL_CANDIDATES = {
-    "epoch": ["epoch", "timestamp", "kickoff_ts", "ts", 0],
-    "league": ["league", "competition", "tournament", 3],
-    "home": ["home", "home_team", "home_name", "Home", 4],
-    "away": ["away", "away_team", "away_name", "Away", 5],
-    "avg":  ["Avg Total Goals", "avg_total_goals", "avg", "AVG", "Avg", -1],  # -1 = fallback euristica
-}
-
-def _pick_col(df: pd.DataFrame, keys):
-    # se è un indice numerico
-    for k in keys:
-        if isinstance(k, int):
-            if k in df.columns:
-                return k
-    # altrimenti prova i nomi
-    lower_map = {str(c).strip().lower(): c for c in df.columns}
-    for k in keys:
-        if isinstance(k, str):
-            kk = k.strip().lower()
-            if kk in lower_map:
-                return lower_map[kk]
+    if 0 <= m <= 130:
+        return m
     return None
 
-def load_matches_csv(url: str) -> pd.DataFrame:
-    df = pd.read_csv(url, header=0)
-    # Se la prima riga sembra dati veri ma i nomi non aiutano, prova anche senza header
-    if not {"home", "away", "league"}.intersection({str(c).lower() for c in df.columns}):
-        try:
-            df2 = pd.read_csv(url, header=None)
-            # usa df2 se ha più colonne o se il primo campo è chiaramente epoch
-            first = df2.iloc[0, 0]
-            if (df2.shape[1] >= df.shape[1]) or (isinstance(first, (int, float)) and int(first) > 1_600_000_000):
-                df = df2
-        except Exception:
-            pass
-    return df
-
-def extract_row_fields(row: pd.Series) -> Optional[Dict[str, Any]]:
-    # epoch
-    epoch_col = _pick_col(row.to_frame().T, CSV_COL_CANDIDATES["epoch"])
-    epoch = None
-    if epoch_col is not None:
-        try:
-            epoch = int(row[epoch_col])
-        except Exception:
-            epoch = None
-
-    # league
-    league_col = _pick_col(row.to_frame().T, CSV_COL_CANDIDATES["league"])
-    league = str(row[league_col]).strip() if league_col is not None else ""
-
-    # home/away
-    home_col = _pick_col(row.to_frame().T, CSV_COL_CANDIDATES["home"])
-    away_col = _pick_col(row.to_frame().T, CSV_COL_CANDIDATES["away"])
-    if home_col is None or away_col is None:
-        return None
-    home = str(row[home_col]).strip()
-    away = str(row[away_col]).strip()
-
-    # avg (tenta varie colonne; se -1 usa euristica: cerca una colonna che contenga 'avg' e sia numerica)
-    avg_col = _pick_col(row.to_frame().T, CSV_COL_CANDIDATES["avg"])
-    avg = None
-    if avg_col is not None and avg_col != -1:
-        try:
-            avg = float(row[avg_col])
-        except Exception:
-            avg = None
-    if avg is None:
-        # euristica: prendi la prima colonna che nel nome contenga 'avg' e sia numerica
-        for c in row.index:
-            name = str(c).lower()
-            if "avg" in name and isinstance(row[c], (int, float)) and not math.isnan(float(row[c])):
-                avg = float(row[c])
-                break
-        # se ancora None, prova a scorrere tutti i valori e prendere un float “ragionevole” 0.5..6
-        if avg is None:
-            for v in row.values:
-                try:
-                    x = float(v)
-                    if 0.3 <= x <= 7.0:
-                        avg = x
-                        break
-                except Exception:
-                    continue
-
-    if avg is None:
-        return None
-
-    return {
-        "epoch": epoch,
-        "league": league,
-        "home": home,
-        "away": away,
-        "avg": avg,
-    }
-
-# -----------------------------
-# RapidAPI: lista eventi live
-# -----------------------------
-def fetch_live_events() -> list[dict]:
-    url = f"{RAPIDAPI_BASE}{RAPIDAPI_EVENTS_PATH}"
-    params = {}
-    # supporta "sport=soccer&..." passato in stringa
-    if RAPIDAPI_EVENTS_PARAMS:
-        for chunk in RAPIDAPI_EVENTS_PARAMS.split("&"):
-            if "=" in chunk:
-                k, v = chunk.split("=", 1)
-                params[k] = v
-
-    headers = {
-        "x-rapidapi-host": RAPIDAPI_HOST,
-        "x-rapidapi-key": RAPIDAPI_KEY,
-    }
-    r = requests.get(url, params=params, headers=headers, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-
-    # La API a volte restituisce {"data":[...]} oppure direttamente [...]
-    if isinstance(data, dict) and "data" in data:
-        data = data["data"]
-    if not isinstance(data, list):
-        return []
-
-    events = []
-    for it in data:
-        try:
-            # diversi payload possibili: prova a leggere home/away/score/minuto
-            home = it.get("home", it.get("homeTeam", it.get("home_name", "")))
-            away = it.get("away", it.get("awayTeam", it.get("away_name", "")))
-            league = it.get("league", it.get("leagueName", it.get("competition", "")))
-            match_id = it.get("id", it.get("event_id", it.get("eventId", "")))
-
-            # score
-            score = it.get("score")
-            if isinstance(score, dict):
-                h = score.get("home", 0)
-                a = score.get("away", 0)
-            elif isinstance(score, str) and "-" in score:
-                parts = score.split("-")
-                h = int(parts[0].strip())
-                a = int(parts[1].strip())
-            else:
-                # a volte le chiavi sono separate
-                h = int(it.get("homeScore", it.get("home_score", 0)) or 0)
-                a = int(it.get("awayScore", it.get("away_score", 0)) or 0)
-
-            # minute (se presente) con sanificazione
-            minute = it.get("minute", it.get("time", it.get("clock", None)))
-            try:
-                minute = int(minute)
-            except Exception:
-                minute = None
-            if minute is not None and not (0 <= minute <= 130):
-                minute = None
-
-            events.append({
-                "id": str(match_id),
-                "home": str(home or ""),
-                "away": str(away or ""),
-                "league": str(league or ""),
-                "home_goals": int(h),
-                "away_goals": int(a),
-                "minute": minute,
-            })
-        except Exception as e:
-            dlog(f"Evento scartato (parse): {e}")
-            continue
-
-    return events
-
-# -----------------------------
-# Filtri leghe
-# -----------------------------
-def league_is_blocked(league: str) -> bool:
-    L = (league or "")
-    # keywords
-    for kw in (EXCLUDE_KEYWORDS.split(",") if EXCLUDE_KEYWORDS else []):
-        if kw.strip() and kw.strip().lower() in L.lower():
-            return True
-    # blacklist pipe-delimited
-    for kw in (LEAGUE_BLACKLIST.split("|") if LEAGUE_BLACKLIST else []):
-        if kw.strip() and kw.strip().lower() in L.lower():
-            return True
-    # whitelist (se impostata, passa solo se presente)
-    if LEAGUE_WHITELIST:
-        ok = False
-        for kw in LEAGUE_WHITELIST.split("|"):
-            if kw.strip() and kw.strip().lower() in L.lower():
-                ok = True
-                break
-        return not ok
-    return False
-
-# -----------------------------
-# Matching CSV <-> Live events
-# -----------------------------
-def build_event_index(events: list[dict]) -> Dict[tuple, dict]:
-    idx = {}
-    for e in events:
-        key = (normalize_name(e["home"]), normalize_name(e["away"]))
-        idx[key] = e
+# =========================
+# Matching CSV <-> Live
+# =========================
+def build_live_index(events: List[Dict[str, Any]]) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    idx: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for ev in events:
+        key = (normalize(ev["home"]), normalize(ev["away"]))
+        idx[key] = ev
     return idx
 
-def minute_for_match(csv_row: Dict[str, Any], maybe_event: Optional[dict]) -> Optional[int]:
-    """
-    Restituisce il minuto “pulito”:
-      1) usa il minuto dell'API se valido,
-      2) altrimenti stima dal kickoff epoch (senza pre-kickoff, range 0..130)
-    """
-    if maybe_event and maybe_event.get("minute") is not None:
-        m = int(maybe_event["minute"])
-        if 0 <= m <= 130:
-            return m
-    return compute_match_minute(csv_row.get("epoch"))
+# =========================
+# Notifiche
+# =========================
+notified: set[str] = set()
 
-# -----------------------------
-# Notifiche (dedup in memoria)
-# -----------------------------
-notified_keys: set[str] = set()
-
-def notify_signal(row: Dict[str, Any], minute: int, league: str):
-    key = f"{row['home']}|{row['away']}|{minute}"
-    if key in notified_keys:
+def notify(league: str, home: str, away: str, minute: int, avg: float):
+    key = f"{normalize(league)}|{normalize(home)}|{normalize(away)}|{minute}"
+    if key in notified:
         return
-    notified_keys.add(key)
-
-    text = (
+    notified.add(key)
+    message = (
         "🚨 <b>SEGNALE OVER 1.5!</b>\n\n"
-        f"⚽ <b>{row['home']}</b> vs <b>{row['away']}</b>\n"
+        f"⚽ <b>{home}</b> vs <b>{away}</b>\n"
         f"🏆 {league}\n"
-        f"📊 <b>AVG Goals:</b> {row['avg']:.2f}\n"
-        f"⏱️ <b>{minute}'</b> - <b>Risultato:</b> 0-0\n"
+        f"📊 AVG Goals: <b>{avg:.2f}</b>\n"
+        f"⏱️ <b>{minute}'</b> - Risultato: <b>0-0</b>\n"
         "✅ Controlla Bet365 Live!\n\n"
         "🎯 <b>Punta Over 1.5 FT</b>"
     )
-    telegram_send(text)
+    send_telegram(message)
+    log(f"Segnale inviato: {home} vs {away} | {league} | {minute}' | AVG {avg:.2f}")
 
-# -----------------------------
-# MAIN LOOP
-# -----------------------------
+# =========================
+# MAIN
+# =========================
 def main():
     if SEND_STARTUP_MESSAGE:
-        telegram_send("🤖 FootyStats Bot avviato\nMonitoraggio partite in corso…")
-
-    log("INFO", f"Soglia AVG: {AVG_GOALS_THRESHOLD:.2f} | Minuti check: {MIN_MINUTE}-{MAX_MINUTE}")
+        send_telegram("🤖 FootyStats Bot avviato\nMonitoraggio partite in corso…")
+    log(f"Soglia AVG: {AVG_GOALS_THRESHOLD:.2f} | Minuti check: {CHECK_TIME_MINUTES}")
 
     while True:
-        log("INFO", "============================================================")
-        log("INFO", "INIZIO CONTROLLO")
-        log("INFO", "============================================================")
         try:
+            log("================================================")
+            log("INIZIO CONTROLLO")
+            log("================================================")
+
             # 1) CSV
-            log("INFO", f"Scarico CSV: {GITHUB_CSV_URL}")
-            df = load_matches_csv(GITHUB_CSV_URL)
-            log("INFO", f"CSV caricato ({len(df)} righe)")
+            log(f"Scarico CSV: {GITHUB_CSV_URL}")
+            rows_raw = fetch_csv_rows(GITHUB_CSV_URL)
+            log(f"CSV caricato ({len(rows_raw)} righe)")
 
-            # 2) Live events API
+            # 2) live events
             events = fetch_live_events()
-            log("INFO", f"API live-events: {len(events)} match live")
-            ev_index = build_event_index(events)
+            log(f"API live-events: {len(events)} match live")
+            live_idx = build_live_index(events)
 
-            # 3) Scansione CSV
+            # 3) scan
             found = 0
-            for _, raw in df.iterrows():
-                fields = extract_row_fields(raw)
-                if not fields:
-                    dlog("Skip riga: campi essenziali mancanti (home/away/avg/epoch).")
+            for r in rows_raw:
+                row = extract_match_fields(r)
+                if not row:
                     continue
 
-                if fields["avg"] < AVG_GOALS_THRESHOLD:
-                    dlog(f"Skip: AVG {fields['avg']:.2f} < soglia")
+                # filtra lega
+                if not league_allowed(row["league"]):
                     continue
 
-                if league_is_blocked(fields["league"]):
-                    dlog(f"Skip lega (blacklist/keyword): {fields['league']}")
+                # filtro AVG
+                if row["avg"] is None or row["avg"] < AVG_GOALS_THRESHOLD:
                     continue
 
-                # match con evento live
-                e = ev_index.get((normalize_name(fields["home"]), normalize_name(fields["away"])))
-                if not e:
-                    # nessun evento live per questa coppia
+                # trova evento live per home/away
+                ev = live_idx.get((normalize(row["home"]), normalize(row["away"])))
+                if not ev:
                     continue
 
-                # stato 0-0?
-                if e["home_goals"] != 0 or e["away_goals"] != 0:
+                # punteggio deve essere 0-0
+                if ev["home_goals"] != 0 or ev["away_goals"] != 0:
                     continue
 
-                # minuto pulito (API valida o fallback kickoff)
-                minute = minute_for_match(fields, e)
+                # deve essere davvero live (funzione lasciata aperta per futuri stati)
+                if not event_is_inplay(ev):
+                    continue
+
+                # minuto: preferisci quello dell'API se 0..130, altrimenti fallback dal kickoff epoch CSV
+                minute = ev.get("minute", None)
+                if minute is None or not (0 <= minute <= 130):
+                    minute = compute_minute_from_kickoff(row.get("epoch"))
+
+                # niente segnali pre-kickoff o minuti strani
                 if minute is None:
-                    dlog(f"Minuto indisponibile o pre-kickoff per {fields['home']} vs {fields['away']}")
+                    dlog(f"Minuto non disponibile per {row['home']} - {row['away']}")
                     continue
 
-                # Finestra di allerta
-                if MIN_MINUTE <= minute <= MAX_MINUTE:
+                # condizione chiave
+                if minute >= CHECK_TIME_MINUTES:
+                    notify(row["league"] or ev.get("league", ""),
+                           row["home"], row["away"], minute, float(row["avg"]))
                     found += 1
-                    notify_signal(fields, minute, e.get("league") or fields["league"])
 
-            log("INFO", f"Opportunità trovate: {found}")
+            log(f"Opportunità trovate: {found}")
 
         except Exception as e:
-            log("ERROR", f"Errore generico: {e}")
+            log(f"Errore generico: {e}")
 
-        log("INFO", f"Sleep {CHECK_INTERVAL_SECONDS}s…")
+        log(f"Sleep {CHECK_INTERVAL_SECONDS}s…")
         time.sleep(CHECK_INTERVAL_SECONDS)
 
-# -----------------------------
 if __name__ == "__main__":
     main()
